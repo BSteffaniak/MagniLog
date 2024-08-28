@@ -1,0 +1,22 @@
+[package]
+authors = ["Braden Steffaniak"]
+categories = [
+    "command-line-interface",
+    "command-line-utilities",
+    "visualization",
+]
+description = "Magnify your logs"
+edition = "2021"
+keywords = ["filter", "logging", "logs", "search"]
+license = "MPL-2.0"
+name = "magnilog"
+readme = "README.md"
+repository = "https://github.com/BSteffaniak/MagniLog"
+version = "0.1.0"
+
+[[bin]]
+name              = "magnilog"
+path              = "src/main.rs"
+required-features = []
+
+[dependencies]
