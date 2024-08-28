@@ -20,6 +20,19 @@ path              = "src/main.rs"
 required-features = []
 
 [dependencies]
+clap = { version = "4.5.16", features = ["derive"] }
+log = "0.4.22"
+thiserror = "1.0.63"
+tokio = { version = "1.39.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "tracing",
+] }
+tokio-stream = "0.1.15"
+tokio-util = "0.7.11"
 
 [features]
 fail-on-warnings = []
