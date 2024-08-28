@@ -1,0 +1,65 @@
+name: Auto-upgrade Dependencies
+
+on:
+    workflow_dispatch:
+    schedule:
+        - cron: '0 1 * * *'
+
+env:
+    CARGO_TERM_COLOR: always
+    AWS_REGION: us-east-1
+
+jobs:
+    upgrade:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  token: ${{ secrets.LOG_SERVICE_UPGRADES_TOKEN }}
+
+            - uses: dtolnay/rust-toolchain@stable
+
+            - name: Install cargo-edit
+              shell: bash
+              run: |
+                  cargo install \
+                      -f cargo-edit \
+                      --git https://github.com/killercup/cargo-edit
+
+            - name: Upgrade
+              id: upgrade
+              shell: bash
+              run: |
+                  cargo upgrade
+                  cargo update
+                  if [ -n "$(git status --porcelain)" ]; then
+                      echo "Found upgrades"
+                      echo "upgraded=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "No upgrades"
+                      echo "upgraded=false" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Build
+              if: ${{ steps.upgrade.outputs.upgraded == 'true'}}
+              shell: bash
+              run: |
+                  cargo build
+
+            - name: Test
+              if: ${{ steps.upgrade.outputs.upgraded == 'true'}}
+              shell: bash
+              run: |
+                  cargo test
+
+            - name: Commit
+              if: ${{ steps.upgrade.outputs.upgraded == 'true'}}
+              shell: bash
+              run: |
+                  git config user.name "Braden Steffaniak"
+                  git config user.email "BradenSteffaniak+bot@gmail.com"
+                  git add .
+                  git commit --message "Upgrade Dependencies"
+                  echo "Pushing upgrades"
+                  git push origin master
