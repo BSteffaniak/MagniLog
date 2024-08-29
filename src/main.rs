@@ -118,17 +118,39 @@ impl MessageLocation {
         let size = self.end - self.start;
         log::debug!("load: start={} end={} size={}", self.start, self.end, size);
 
-        futures::pin_mut!(reader);
         reader
             .seek(std::io::SeekFrom::Start(self.start as u64))
             .await?;
 
-        let mut buffer = MESSAGE_BUFFER.write().await;
+        if size > MESSAGE_BUFFER_SIZE {
+            let mut log = "".to_string();
+            let mut pos = 0;
 
-        let data = reader.read_exact(&mut buffer[..size]).await?;
-        let log = str::from_utf8(&buffer[..data])?;
+            while pos + MESSAGE_BUFFER_SIZE < size {
+                let mut buffer = MESSAGE_BUFFER.write().await;
 
-        parse_message(log, self)
+                let size = reader.read_exact(&mut buffer[..]).await?;
+                log.push_str(str::from_utf8(&buffer[..size])?);
+                pos += size;
+            }
+
+            let mut buffer = MESSAGE_BUFFER.write().await;
+
+            let size = reader
+                .read_exact(&mut buffer[..size % MESSAGE_BUFFER_SIZE])
+                .await?;
+
+            log.push_str(str::from_utf8(&buffer[..size])?);
+
+            parse_message(&log, self)
+        } else {
+            let mut buffer = MESSAGE_BUFFER.write().await;
+
+            let size = reader.read_exact(&mut buffer[..size]).await?;
+            let log = str::from_utf8(&buffer[..size])?;
+
+            parse_message(log, self)
+        }
     }
 }
 
