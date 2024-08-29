@@ -187,8 +187,8 @@ pub struct LogReader {
     len: usize,
     reader: Pin<Box<dyn AsyncReadSeek>>,
     buffer: [u8; BUFFER_SIZE],
-    #[allow(unused)]
-    current_message: Arc<RwLock<Option<String>>>,
+    start_message: Arc<RwLock<String>>,
+    end_message: Arc<RwLock<String>>,
 }
 
 impl LogReader {
@@ -204,7 +204,8 @@ impl LogReader {
             len,
             reader: Box::pin(reader),
             buffer: [0; 1024 * 32],
-            current_message: Arc::new(RwLock::new(None)),
+            start_message: Arc::new(RwLock::new("".to_owned())),
+            end_message: Arc::new(RwLock::new("".to_owned())),
         }
     }
 
@@ -233,23 +234,36 @@ impl LogReader {
             let logs = str::from_utf8(&self.buffer[..size])?;
             current_message.push_str(logs);
 
-            let end = self
+            if let Some((start, end)) = self
                 .parse_logs(read + self.offset, &current_message)
-                .await?;
+                .await?
+            {
+                if read == 0 {
+                    *self.start_message.write().await =
+                        current_message.as_str()[..start].to_owned();
+                }
 
-            // handle unicode??
-            current_message = current_message.as_str()[end..].to_owned();
+                // handle unicode??
+                current_message = current_message.as_str()[end..].to_owned();
+            }
 
             read += size;
         }
 
+        *self.end_message.write().await = current_message;
+
         Ok(())
     }
 
-    async fn parse_logs(&self, offset: usize, logs: &str) -> Result<usize, SendError> {
+    async fn parse_logs(
+        &self,
+        offset: usize,
+        logs: &str,
+    ) -> Result<Option<(usize, usize)>, SendError> {
         let matches = LOG_POSITION_START_REGEX.captures_iter(logs);
 
-        let mut end = 0;
+        let mut start = None;
+        let mut end = None;
 
         for caps in matches {
             for i in 0..caps.len() {
@@ -270,7 +284,11 @@ impl LogReader {
 
             let value = caps.get(0).unwrap();
 
-            end = value.end();
+            if start.is_none() {
+                start = Some(value.start());
+            }
+
+            end = Some(value.end());
 
             let message = MessageLocation {
                 level,
@@ -285,7 +303,11 @@ impl LogReader {
             self.sender.send(Some(message)).await?;
         }
 
-        Ok(end)
+        if let (Some(start), Some(end)) = (start, end) {
+            Ok(Some((start, end)))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -317,6 +339,7 @@ async fn read_log<P: AsRef<Path>>(log: P, threads: usize) -> Result<(), ReadLogE
 
     let sections = threads;
     let chunk_size = len / sections;
+    let mut readers = vec![];
     let mut workers = vec![];
 
     for section in 0..sections {
@@ -327,10 +350,27 @@ async fn read_log<P: AsRef<Path>>(log: P, threads: usize) -> Result<(), ReadLogE
             chunk_size
         };
 
-        workers.push(read_log_section(&log, tx.clone(), offset, len).await?);
+        let (reader, worker) = read_log_section(&log, tx.clone(), offset, len).await?;
+
+        readers.push(reader);
+        workers.push(worker);
     }
 
     let responses = futures::future::join_all(workers).await;
+
+    for (prev, reader) in readers.iter().zip(readers.iter().skip(1)) {
+        let prev = prev.read().await;
+        let end_message = prev.end_message.read().await.to_owned();
+        let reader = reader.read().await;
+        let start_message = reader.start_message.read().await;
+
+        let offset = prev.offset + BUFFER_SIZE - end_message.len();
+        let mut message = end_message;
+        message.push_str(&start_message);
+
+        prev.parse_logs(offset, &message).await?;
+    }
+
     tx.send(None).await?;
 
     let errors = responses
@@ -364,7 +404,7 @@ async fn read_log_section<P: AsRef<Path>>(
     sender: AsyncSender<Option<MessageLocation>>,
     offset: usize,
     len: usize,
-) -> Result<JoinHandle<Result<(), ReadLogError>>, ReadLogError> {
+) -> Result<(Arc<RwLock<LogReader>>, JoinHandle<Result<(), ReadLogError>>), ReadLogError> {
     log::debug!("read_log_section: offset={offset} len={len}");
     let file = tokio::fs::OpenOptions::new()
         .create(false)
@@ -374,9 +414,20 @@ async fn read_log_section<P: AsRef<Path>>(
         .await?;
 
     let reader = BufReader::new(file);
-    let mut reader = LogReader::new(sender.clone(), reader, offset, len);
+    let reader = Arc::new(RwLock::new(LogReader::new(
+        sender.clone(),
+        reader,
+        offset,
+        len,
+    )));
 
-    let read_finished = tokio::task::spawn(async move { reader.read().await });
+    let read_finished = tokio::task::spawn({
+        let reader = reader.clone();
+        async move {
+            let mut reader = reader.write().await;
+            reader.read().await
+        }
+    });
 
-    Ok(read_finished)
+    Ok((reader, read_finished))
 }
