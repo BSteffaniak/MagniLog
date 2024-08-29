@@ -67,18 +67,30 @@ fn main() -> Result<(), MagniLogError> {
 pub struct Message {
     pub message: String,
     pub level: String,
-    pub ts: usize,
+    pub ts: String,
     pub target: String,
     pub module_path: String,
     pub location: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MessageLocation {
     pub level: String,
     pub ts: usize,
     pub start: usize,
     pub end: usize,
+}
+
+impl PartialOrd for MessageLocation {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.ts.cmp(&other.ts))
+    }
+}
+
+impl Ord for MessageLocation {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ts.cmp(&other.ts)
+    }
 }
 
 pub struct LogCollection {
@@ -152,10 +164,7 @@ fn parse_message(log: &str) -> Message {
     Message {
         message: "".into(),
         level,
-        ts: ts.parse::<usize>().unwrap_or_else(|e| {
-            log::warn!("Failed to parse timestamp: {ts} ({e:?})");
-            0
-        }),
+        ts,
         target,
         module_path,
         location,
@@ -391,7 +400,16 @@ async fn read_log<P: AsRef<Path>>(log: P, threads: usize) -> Result<(), ReadLogE
         ByteSize(len as u64),
     );
 
-    let collection = collection.read().await;
+    let mut collection = collection.write().await;
+    let start = std::time::SystemTime::now();
+    log::debug!("Sorting messages");
+    collection.messages.sort();
+    let end = std::time::SystemTime::now();
+    log::debug!(
+        "Sorted messages in {}ms {}",
+        end.duration_since(start).unwrap().as_millis(),
+        ByteSize(len as u64),
+    );
     let messages = &collection.messages;
 
     log::debug!("{} total messages", messages.len());
