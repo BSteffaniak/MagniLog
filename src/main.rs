@@ -8,6 +8,7 @@ use bytesize::ByteSize;
 use clap::Parser;
 use free_log_client::LogsInitError;
 use kanal::{AsyncReceiver, AsyncSender, SendError};
+use serde_json::Value;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, BufReader};
@@ -65,9 +66,8 @@ fn main() -> Result<(), MagniLogError> {
 
 #[derive(Debug, Clone)]
 pub struct Message {
-    pub message: String,
-    pub level: String,
-    pub ts: String,
+    pub message_location: MessageLocation,
+    pub messages: Vec<String>,
     pub target: String,
     pub module_path: String,
     pub location: String,
@@ -76,9 +76,36 @@ pub struct Message {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MessageLocation {
     pub level: String,
-    pub ts: usize,
+    pub ts: String,
     pub start: usize,
     pub end: usize,
+}
+
+const MESSAGE_BUFFER_SIZE: usize = 1024 * 32;
+static MESSAGE_BUFFER: LazyLock<RwLock<[u8; MESSAGE_BUFFER_SIZE]>> =
+    LazyLock::new(|| RwLock::new([0; MESSAGE_BUFFER_SIZE]));
+
+impl MessageLocation {
+    pub async fn load(
+        self,
+        end: usize,
+        reader: &mut (impl AsyncReadSeek + Unpin),
+    ) -> Result<Message, ReadLogError> {
+        let size = end - self.start;
+        log::debug!("load: start={} end={} size={}", self.start, end, size);
+
+        futures::pin_mut!(reader);
+        reader
+            .seek(std::io::SeekFrom::Start(self.start as u64))
+            .await?;
+
+        let mut buffer = MESSAGE_BUFFER.write().await;
+
+        let data = reader.read_exact(&mut buffer[..size]).await?;
+        let log = str::from_utf8(&buffer[..data])?;
+
+        parse_message(log, self)
+    }
 }
 
 impl PartialOrd for MessageLocation {
@@ -114,31 +141,33 @@ impl LogCollection {
 }
 
 static LOG_POSITION_START_REGEX: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(^|[\n\r])\{"level":"(\w+)","ts":(\d+)"#).unwrap());
+    LazyLock::new(|| regex::Regex::new(r#"(^|[\n\r])\{"level":"(\w+)","ts":([^,]+),"#).unwrap());
 static LOG_START_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(^|[\n\r])\{"level":"(\w+)","ts":(\d+),"values":\[(("(?:[^"\\]|\\.)*"(\s*,\s*)?)*)\],"target":"((?:[^"\\]|\\.)*)","modulePath":"((?:[^"\\]|\\.)*)","location":"((?:[^"\\]|\\.)*)""#).unwrap()
+    regex::Regex::new(r#"(^|[\n\r])\{"level":"(\w+)","ts":([^,]+),"values":(\[("(?:[^"\\]|\\.)*"(\s*,\s*)?)*\]),"target":"((?:[^"\\]|\\.)*)","modulePath":"((?:[^"\\]|\\.)*)","location":"((?:[^"\\]|\\.)*)""#).unwrap()
 });
 
-#[allow(unused)]
-fn parse_message(log: &str) -> Message {
+fn parse_message(log: &str, message_location: MessageLocation) -> Result<Message, ReadLogError> {
     let matches = LOG_START_REGEX.captures_iter(log);
 
+    log::debug!("parsing message: '{log}'");
     let caps = matches.into_iter().next().unwrap();
 
     for i in 0..caps.len() {
         log::trace!("parse_message: match {i}: {:?}\n", caps.get(i));
     }
-    let level = if let Some(level) = caps.get(2) {
-        let level = level.as_str();
-        level.to_string()
+    let messages = if let Some(messages) = caps.get(4) {
+        let messages = messages.as_str();
+        let messages: Value = serde_json::from_str(messages)?;
+        messages
+            .as_array()
+            .map(|x| {
+                x.iter()
+                    .filter_map(|x| x.as_str().map(|x| x.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
     } else {
-        "".to_string()
-    };
-    let ts = if let Some(ts) = caps.get(3) {
-        let ts = ts.as_str();
-        ts.to_string()
-    } else {
-        "".to_string()
+        vec![]
     };
     let target = if let Some(target) = caps.get(7) {
         let target = target.as_str();
@@ -159,16 +188,13 @@ fn parse_message(log: &str) -> Message {
         "".to_string()
     };
 
-    let value = caps.get(0).unwrap();
-
-    Message {
-        message: "".into(),
-        level,
-        ts,
+    Ok(Message {
+        message_location,
+        messages,
         target,
         module_path,
         location,
-    }
+    })
 }
 
 #[derive(Debug, Error)]
@@ -179,6 +205,8 @@ pub enum ReadLogError {
     Utf8(#[from] std::str::Utf8Error),
     #[error(transparent)]
     Send(#[from] SendError),
+    #[error(transparent)]
+    Serde(#[from] serde_json::Error),
     #[error(transparent)]
     Join(#[from] JoinError),
 }
@@ -301,10 +329,7 @@ impl LogReader {
 
             let message = MessageLocation {
                 level,
-                ts: ts.parse::<usize>().unwrap_or_else(|e| {
-                    log::warn!("Failed to parse timestamp: {ts} ({e:?})");
-                    0
-                }),
+                ts,
                 start: offset + value.start(),
                 end: offset + value.end(),
             };
@@ -411,6 +436,21 @@ async fn read_log<P: AsRef<Path>>(log: P, threads: usize) -> Result<(), ReadLogE
         ByteSize(len as u64),
     );
     let messages = &collection.messages;
+
+    let file = tokio::fs::OpenOptions::new()
+        .create(false)
+        .write(false)
+        .read(true)
+        .open(&log)
+        .await?;
+
+    let mut reader = BufReader::new(file);
+
+    for (message, next) in messages.iter().take(5).zip(messages.iter().skip(1).take(5)) {
+        let message = message.to_owned().load(next.start, &mut reader).await?;
+        log::debug!("Message: {message:?}");
+        log::info!("{}", message.messages.join("\n"));
+    }
 
     log::debug!("{} total messages", messages.len());
 
