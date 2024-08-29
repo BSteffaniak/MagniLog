@@ -19,6 +19,8 @@ use tokio::task::{JoinError, JoinHandle};
 struct Args {
     #[arg(short, long)]
     file: String,
+    #[arg(short, long)]
+    threads: Option<usize>,
 }
 
 #[derive(Debug, Error)]
@@ -29,28 +31,36 @@ pub enum MagniLogError {
     LogsInit(#[from] LogsInitError),
 }
 
-#[tokio::main]
-async fn main() -> Result<(), MagniLogError> {
-    let logs_config = free_log_client::LogsConfig::builder();
-
-    #[cfg(debug_assertions)]
-    const DEFAULT_LOG_LEVEL: &str = "magnilog=trace";
-    #[cfg(not(debug_assertions))]
-    const DEFAULT_LOG_LEVEL: &str = "magnilog=info";
-
-    free_log_client::init(logs_config.env_filter(match option_env!("MAGNILOG_LOG") {
-        Some(v) => v,
-        None => match option_env!("RUST_LOG") {
-            Some(v) => v,
-            None => DEFAULT_LOG_LEVEL,
-        },
-    }))?;
-
+fn main() -> Result<(), MagniLogError> {
     let args = Args::parse();
+    let threads = args.threads.unwrap_or(8);
 
-    read_log(&args.file).await?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(threads + 1)
+        .build()
+        .unwrap();
 
-    Ok(())
+    runtime.block_on(async move {
+        let logs_config = free_log_client::LogsConfig::builder();
+
+        #[cfg(debug_assertions)]
+        const DEFAULT_LOG_LEVEL: &str = "magnilog=trace";
+        #[cfg(not(debug_assertions))]
+        const DEFAULT_LOG_LEVEL: &str = "magnilog=info";
+
+        free_log_client::init(logs_config.env_filter(match option_env!("MAGNILOG_LOG") {
+            Some(v) => v,
+            None => match option_env!("RUST_LOG") {
+                Some(v) => v,
+                None => DEFAULT_LOG_LEVEL,
+            },
+        }))?;
+
+        read_log(&args.file, threads).await?;
+
+        Ok(())
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -279,7 +289,7 @@ impl LogReader {
     }
 }
 
-async fn read_log<P: AsRef<Path>>(log: P) -> Result<(), ReadLogError> {
+async fn read_log<P: AsRef<Path>>(log: P, threads: usize) -> Result<(), ReadLogError> {
     let start = std::time::SystemTime::now();
 
     let file = tokio::fs::OpenOptions::new()
@@ -305,7 +315,7 @@ async fn read_log<P: AsRef<Path>>(log: P) -> Result<(), ReadLogError> {
         }
     });
 
-    let sections = 16;
+    let sections = threads;
     let chunk_size = len / sections;
     let mut workers = vec![];
 
