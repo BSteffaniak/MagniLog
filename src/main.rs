@@ -22,6 +22,10 @@ struct Args {
     file: String,
     #[arg(short, long)]
     threads: Option<usize>,
+    #[arg(short, long)]
+    offset: Option<usize>,
+    #[arg(short, long)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Error)]
@@ -58,7 +62,7 @@ fn main() -> Result<(), MagniLogError> {
             },
         }))?;
 
-        read_log(&args.file, threads).await?;
+        read_log(&args.file, args.offset, args.limit, threads).await?;
 
         Ok(())
     })
@@ -81,6 +85,12 @@ pub struct MessageLocation {
     pub end: usize,
 }
 
+pub struct TempMessageLocation {
+    pub level: String,
+    pub ts: String,
+    pub start: usize,
+}
+
 const MESSAGE_BUFFER_SIZE: usize = 1024 * 32;
 static MESSAGE_BUFFER: LazyLock<RwLock<[u8; MESSAGE_BUFFER_SIZE]>> =
     LazyLock::new(|| RwLock::new([0; MESSAGE_BUFFER_SIZE]));
@@ -88,11 +98,10 @@ static MESSAGE_BUFFER: LazyLock<RwLock<[u8; MESSAGE_BUFFER_SIZE]>> =
 impl MessageLocation {
     pub async fn load(
         self,
-        end: usize,
         reader: &mut (impl AsyncReadSeek + Unpin),
     ) -> Result<Message, ReadLogError> {
-        let size = end - self.start;
-        log::debug!("load: start={} end={} size={}", self.start, end, size);
+        let size = self.end - self.start;
+        log::debug!("load: start={} end={} size={}", self.start, self.end, size);
 
         futures::pin_mut!(reader);
         reader
@@ -150,7 +159,9 @@ fn parse_message(log: &str, message_location: MessageLocation) -> Result<Message
     let matches = LOG_START_REGEX.captures_iter(log);
 
     log::debug!("parsing message: '{log}'");
-    let caps = matches.into_iter().next().unwrap();
+    let Some(caps) = matches.into_iter().next() else {
+        panic!("Failed to parse message '{log}'\nmessage_location={message_location:?}");
+    };
 
     for i in 0..caps.len() {
         log::trace!("parse_message: match {i}: {:?}\n", caps.get(i));
@@ -226,6 +237,7 @@ pub struct LogReader {
     buffer: [u8; BUFFER_SIZE],
     start_message: Arc<RwLock<String>>,
     end_message: Arc<RwLock<String>>,
+    temp_message_location: Option<TempMessageLocation>,
 }
 
 impl LogReader {
@@ -243,6 +255,7 @@ impl LogReader {
             buffer: [0; 1024 * 32],
             start_message: Arc::new(RwLock::new("".to_owned())),
             end_message: Arc::new(RwLock::new("".to_owned())),
+            temp_message_location: None,
         }
     }
 
@@ -252,6 +265,7 @@ impl LogReader {
             .await?;
 
         let mut read = 0;
+        let mut last_start = None;
 
         let mut current_message = "".to_owned();
 
@@ -271,34 +285,41 @@ impl LogReader {
             let logs = str::from_utf8(&self.buffer[..size])?;
             current_message.push_str(logs);
 
-            if let Some((start, end)) = self
+            if let Some((first_start, start, _end)) = self
                 .parse_logs(read + self.offset, &current_message)
                 .await?
             {
                 if read == 0 {
                     *self.start_message.write().await =
-                        current_message.as_str()[..start].to_owned();
+                        current_message.as_str()[..first_start].to_owned();
                 }
 
                 // handle unicode??
-                current_message = current_message.as_str()[end..].to_owned();
+                if read + size < self.len {
+                    current_message = "".to_owned();
+                } else {
+                    last_start.replace(start);
+                }
             }
 
             read += size;
         }
 
-        *self.end_message.write().await = current_message;
+        if let Some(start) = last_start {
+            *self.end_message.write().await = current_message.as_str()[start..].to_owned();
+        }
 
         Ok(())
     }
 
     async fn parse_logs(
-        &self,
+        &mut self,
         offset: usize,
         logs: &str,
-    ) -> Result<Option<(usize, usize)>, SendError> {
+    ) -> Result<Option<(usize, usize, usize)>, SendError> {
         let matches = LOG_POSITION_START_REGEX.captures_iter(logs);
 
+        let mut first_start = None;
         let mut start = None;
         let mut end = None;
 
@@ -321,31 +342,43 @@ impl LogReader {
 
             let value = caps.get(0).unwrap();
 
-            if start.is_none() {
-                start = Some(value.start());
+            if first_start.is_none() {
+                first_start = Some(value.start());
             }
-
+            start = Some(value.start());
             end = Some(value.end());
 
-            let message = MessageLocation {
+            if let Some(temp) = self.temp_message_location.take() {
+                let message = MessageLocation {
+                    level: temp.level,
+                    ts: temp.ts,
+                    start: temp.start,
+                    end: offset + value.start(),
+                };
+                self.sender.send(Some(message)).await?;
+            }
+
+            self.temp_message_location.replace(TempMessageLocation {
                 level,
                 ts,
                 start: offset + value.start(),
-                end: offset + value.end(),
-            };
-
-            self.sender.send(Some(message)).await?;
+            });
         }
 
-        if let (Some(start), Some(end)) = (start, end) {
-            Ok(Some((start, end)))
+        if let (Some(first_start), Some(start), Some(end)) = (first_start, start, end) {
+            Ok(Some((first_start, start, end)))
         } else {
             Ok(None)
         }
     }
 }
 
-async fn read_log<P: AsRef<Path>>(log: P, threads: usize) -> Result<(), ReadLogError> {
+async fn read_log<P: AsRef<Path>>(
+    log: P,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    threads: usize,
+) -> Result<(), ReadLogError> {
     let start = std::time::SystemTime::now();
 
     let file = tokio::fs::OpenOptions::new()
@@ -392,17 +425,22 @@ async fn read_log<P: AsRef<Path>>(log: P, threads: usize) -> Result<(), ReadLogE
 
     let responses = futures::future::join_all(workers).await;
 
+    // stitch together individual readers and get the messages that were in the gap
     for (prev, reader) in readers.iter().zip(readers.iter().skip(1)) {
-        let prev = prev.read().await;
+        let mut prev = prev.write().await;
         let end_message = prev.end_message.read().await.to_owned();
         let reader = reader.read().await;
         let start_message = reader.start_message.read().await;
 
-        let offset = prev.offset + BUFFER_SIZE - end_message.len();
-        let mut message = end_message;
-        message.push_str(&start_message);
-
-        prev.parse_logs(offset, &message).await?;
+        if let Some(temp) = prev.temp_message_location.take() {
+            let message = MessageLocation {
+                level: temp.level,
+                ts: temp.ts,
+                start: temp.start,
+                end: temp.start + end_message.len() + start_message.len(),
+            };
+            prev.sender.send(Some(message)).await?;
+        }
     }
 
     tx.send(None).await?;
@@ -431,9 +469,8 @@ async fn read_log<P: AsRef<Path>>(log: P, threads: usize) -> Result<(), ReadLogE
     collection.messages.sort();
     let end = std::time::SystemTime::now();
     log::debug!(
-        "Sorted messages in {}ms {}",
+        "Sorted messages in {}ms",
         end.duration_since(start).unwrap().as_millis(),
-        ByteSize(len as u64),
     );
     let messages = &collection.messages;
 
@@ -446,10 +483,13 @@ async fn read_log<P: AsRef<Path>>(log: P, threads: usize) -> Result<(), ReadLogE
 
     let mut reader = BufReader::new(file);
 
-    for (message, next) in messages.iter().take(5).zip(messages.iter().skip(1).take(5)) {
-        let message = message.to_owned().load(next.start, &mut reader).await?;
-        log::debug!("Message: {message:?}");
-        log::info!("{}", message.messages.join("\n"));
+    if let Some(offset) = offset {
+        let limit = limit.unwrap_or(messages.len());
+        for message in messages.iter().skip(offset).take(limit) {
+            let message = message.to_owned().load(&mut reader).await?;
+            log::debug!("Message: {message:?}");
+            println!("{}", message.messages.join("\n"));
+        }
     }
 
     log::debug!("{} total messages", messages.len());
