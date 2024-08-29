@@ -12,6 +12,7 @@ use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, BufReader};
 use tokio::sync::RwLock;
+use tokio::task::{JoinError, JoinHandle};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -159,11 +160,13 @@ pub enum ReadLogError {
     Utf8(#[from] std::str::Utf8Error),
     #[error(transparent)]
     Send(#[from] SendError),
+    #[error(transparent)]
+    Join(#[from] JoinError),
 }
 
-pub trait AsyncReadSeek: AsyncRead + AsyncSeek {}
+pub trait AsyncReadSeek: AsyncRead + AsyncSeek + Send + Sync {}
 
-impl<R: AsyncRead + AsyncSeek> AsyncReadSeek for BufReader<R> {}
+impl<R: AsyncRead + AsyncSeek + Send + Sync> AsyncReadSeek for BufReader<R> {}
 impl AsyncReadSeek for File {}
 
 const BUFFER_SIZE: usize = 1024 * 32;
@@ -202,6 +205,8 @@ impl LogReader {
 
         let mut read = 0;
 
+        let mut current_message = "".to_owned();
+
         while read < self.len {
             let size = if read + BUFFER_SIZE >= self.len {
                 self.reader
@@ -215,8 +220,15 @@ impl LogReader {
                 break;
             }
 
-            self.parse_logs(read + self.offset, str::from_utf8(&self.buffer[..size])?)
+            let logs = str::from_utf8(&self.buffer[..size])?;
+            current_message.push_str(logs);
+
+            let end = self
+                .parse_logs(read + self.offset, &current_message)
                 .await?;
+
+            // handle unicode??
+            current_message = current_message.as_str()[end..].to_owned();
 
             read += size;
         }
@@ -224,8 +236,10 @@ impl LogReader {
         Ok(())
     }
 
-    async fn parse_logs(&self, offset: usize, logs: &str) -> Result<(), SendError> {
+    async fn parse_logs(&self, offset: usize, logs: &str) -> Result<usize, SendError> {
         let matches = LOG_POSITION_START_REGEX.captures_iter(logs);
+
+        let mut end = 0;
 
         for caps in matches {
             for i in 0..caps.len() {
@@ -246,6 +260,8 @@ impl LogReader {
 
             let value = caps.get(0).unwrap();
 
+            end = value.end();
+
             let message = MessageLocation {
                 level,
                 ts: ts.parse::<usize>().unwrap_or_else(|e| {
@@ -259,7 +275,7 @@ impl LogReader {
             self.sender.send(Some(message)).await?;
         }
 
-        Ok(())
+        Ok(end)
     }
 }
 
@@ -280,9 +296,6 @@ async fn read_log<P: AsRef<Path>>(log: P) -> Result<(), ReadLogError> {
 
     let collection = Arc::new(RwLock::new(LogCollection::new(rx)));
 
-    let reader = BufReader::new(file.try_clone().await?);
-    let mut reader = LogReader::new(tx.clone(), reader, 0, len);
-
     tokio::task::spawn({
         let collection = collection.clone();
         async move {
@@ -292,8 +305,34 @@ async fn read_log<P: AsRef<Path>>(log: P) -> Result<(), ReadLogError> {
         }
     });
 
-    reader.read().await?;
+    let sections = 16;
+    let chunk_size = len / sections;
+    let mut workers = vec![];
+
+    for section in 0..sections {
+        let offset = section * chunk_size;
+        let len = if section == sections - 1 {
+            len - chunk_size * (sections - 1)
+        } else {
+            chunk_size
+        };
+
+        workers.push(read_log_section(&log, tx.clone(), offset, len).await?);
+    }
+
+    let responses = futures::future::join_all(workers).await;
     tx.send(None).await?;
+
+    let errors = responses
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.err())
+        .collect::<Vec<_>>();
+
+    if !errors.is_empty() {
+        log::error!("Errors: {errors:?}");
+        return Err(errors.into_iter().next().unwrap());
+    }
 
     let end = std::time::SystemTime::now();
     log::info!(
@@ -308,4 +347,26 @@ async fn read_log<P: AsRef<Path>>(log: P) -> Result<(), ReadLogError> {
     log::debug!("{} total messages", messages.len());
 
     Ok(())
+}
+
+async fn read_log_section<P: AsRef<Path>>(
+    log: P,
+    sender: AsyncSender<Option<MessageLocation>>,
+    offset: usize,
+    len: usize,
+) -> Result<JoinHandle<Result<(), ReadLogError>>, ReadLogError> {
+    log::debug!("read_log_section: offset={offset} len={len}");
+    let file = tokio::fs::OpenOptions::new()
+        .create(false)
+        .write(false)
+        .read(true)
+        .open(&log)
+        .await?;
+
+    let reader = BufReader::new(file);
+    let mut reader = LogReader::new(sender.clone(), reader, offset, len);
+
+    let read_finished = tokio::task::spawn(async move { reader.read().await });
+
+    Ok(read_finished)
 }
