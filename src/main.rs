@@ -19,6 +19,8 @@ use tokio::task::{JoinError, JoinHandle};
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
+    print: bool,
+    #[clap(value_name = "FILE", index = 1)]
     file: String,
     #[arg(short, long)]
     threads: Option<usize>,
@@ -26,6 +28,10 @@ struct Args {
     offset: Option<usize>,
     #[arg(short, long)]
     limit: Option<usize>,
+    #[arg(short, long)]
+    filters: Option<Vec<String>>,
+    #[arg(long)]
+    level: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -62,7 +68,16 @@ fn main() -> Result<(), MagniLogError> {
             },
         }))?;
 
-        read_log(&args.file, args.offset, args.limit, threads).await?;
+        read_log(
+            &args.file,
+            args.offset,
+            args.limit,
+            args.filters,
+            args.level,
+            args.print,
+            threads,
+        )
+        .await?;
 
         Ok(())
     })
@@ -218,6 +233,8 @@ pub enum ReadLogError {
     Send(#[from] SendError),
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
+    #[error(transparent)]
+    Regex(#[from] regex::Error),
     #[error(transparent)]
     Join(#[from] JoinError),
 }
@@ -377,6 +394,9 @@ async fn read_log<P: AsRef<Path>>(
     log: P,
     offset: Option<usize>,
     limit: Option<usize>,
+    filters: Option<Vec<String>>,
+    level: Option<String>,
+    print: bool,
     threads: usize,
 ) -> Result<(), ReadLogError> {
     let start = std::time::SystemTime::now();
@@ -483,16 +503,48 @@ async fn read_log<P: AsRef<Path>>(
 
     let mut reader = BufReader::new(file);
 
-    if let Some(offset) = offset {
-        let limit = limit.unwrap_or(messages.len());
-        for message in messages.iter().skip(offset).take(limit) {
-            let message = message.to_owned().load(&mut reader).await?;
-            log::debug!("Message: {message:?}");
-            println!("{}", message.messages.join("\n"));
+    let mut sum = 0;
+
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(messages.len());
+    let filters = filters
+        .map(|x| {
+            x.into_iter()
+                .map(|x| regex::Regex::new(&x))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+
+    for message in messages
+        .iter()
+        .filter(|x| {
+            !level
+                .as_ref()
+                .is_some_and(|level| x.level != level.as_str())
+        })
+        .skip(offset)
+        .take(limit)
+    {
+        let message = message.to_owned().load(&mut reader).await?;
+
+        if message.messages.iter().any(|x| {
+            !filters
+                .as_ref()
+                .is_some_and(|f| !f.iter().all(|f| f.is_match(x)))
+        }) {
+            if print {
+                log::debug!("Message: {message:?}");
+                println!(
+                    "{}: {}",
+                    message.message_location.ts,
+                    message.messages.join("\n")
+                );
+            }
+            sum += 1;
         }
     }
 
-    log::debug!("{} total messages", messages.len());
+    log::info!("{} total messages ({sum} matched messages)", messages.len());
 
     Ok(())
 }
