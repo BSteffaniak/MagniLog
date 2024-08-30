@@ -3,7 +3,7 @@ name: Auto-upgrade Dependencies
 on:
     workflow_dispatch:
     schedule:
-        - cron: '0 1 * * *'
+        - cron: "0 1 * * *"
 
 env:
     CARGO_TERM_COLOR: always
@@ -16,7 +16,7 @@ jobs:
         steps:
             - uses: actions/checkout@v4
               with:
-                  token: ${{ secrets.LOG_SERVICE_UPGRADES_TOKEN }}
+                  token: ${{ secrets.MAGNILOG_UPGRADES_TOKEN }}
 
             - uses: dtolnay/rust-toolchain@stable
 
