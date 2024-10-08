@@ -23,7 +23,7 @@ required-features = []
 async-trait = "0.1.83"
 bytesize = "1.3.0"
 clap = { version = "4.5.19", features = ["derive"] }
-free_log_client = "0.3.0"
+free_log_client = "0.4.1"
 futures = "0.3.31"
 kanal = "0.1.0-pre8"
 log = "0.4.22"
