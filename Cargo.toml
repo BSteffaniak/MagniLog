@@ -29,8 +29,8 @@ kanal = "0.1.0-pre8"
 log = "0.4.22"
 regex = "1.11.1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1.0.133"
-thiserror = "2.0.8"
+serde_json = "1.0.134"
+thiserror = "2.0.9"
 tokio = { version = "1.42.0", features = [
     "fs",
     "io-util",
