@@ -22,7 +22,7 @@ required-features = []
 [dependencies]
 async-trait = "0.1.86"
 bytesize = "1.3.2"
-clap = { version = "4.5.30", features = ["derive"] }
+clap = { version = "4.5.31", features = ["derive"] }
 free_log_client = "0.5.0"
 futures = "0.3.31"
 kanal = "0.1.0-pre8"
