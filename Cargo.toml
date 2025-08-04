@@ -40,7 +40,7 @@ tokio = { version = "1.47.1", features = [
     "tracing",
 ] }
 tokio-stream = "0.1.17"
-tokio-util = "0.7.15"
+tokio-util = "0.7.16"
 
 [features]
 fail-on-warnings = []
